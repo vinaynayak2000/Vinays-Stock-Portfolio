@@ -68,32 +68,73 @@ function parseCSV(text: string): string[][] {
 }
 
 function toFloat(s: string): number | null {
-  const v = parseFloat(s.replace(/[₹,\s]/g, ""));
+  const v = parseFloat((s ?? "").replace(/[₹,%,\s]/g, ""));
   return isNaN(v) ? null : v;
 }
 
-function rowToStock(row: string[], id: number): Stock | null {
-  if (row.length < 10) return null;
-  const date   = row[0].trim();
-  if (!date || date.toLowerCase() === "date") return null; // header row
+// Detect column positions by header name — resilient to column reordering
+function detectColumns(headers: string[]) {
+  const h = headers.map(c => c.trim().toLowerCase());
+  const find = (...candidates: string[]) => {
+    for (const c of candidates) {
+      const i = h.indexOf(c);
+      if (i >= 0) return i;
+    }
+    // partial match fallback
+    for (const c of candidates) {
+      const i = h.findIndex(x => x.includes(c));
+      if (i >= 0) return i;
+    }
+    return -1;
+  };
+  return {
+    date:          find("date"),
+    name:          find("stock name", "name", "stock"),
+    ticker:        find("ticker", "symbol"),
+    entryPrice:    find("entry price", "entry", "buy price"),
+    exitPrice:     find("exit price", "exit", "sell price"),
+    sl:            find("sl", "stop loss", "stoploss"),
+    cmp:           find("cmp", "current price", "ltp"),
+    target:        find("target price", "target"),
+    quantity:      find("quantity", "qty", "shares"),
+    moneyInvested: find("money invested", "invested", "investment"),
+    status:        find("status"),
+    category:      find("category", "type", "asset type", "asset"),
+  };
+}
 
-  const name   = row[1].replace(/\s+/g, " ").trim();
-  const ticker = row[2].trim();
-  const entry  = toFloat(row[3]);
+type ColMap = ReturnType<typeof detectColumns>;
+
+function get(row: string[], idx: number): string {
+  return idx >= 0 ? (row[idx] ?? "") : "";
+}
+
+function rowToStock(row: string[], id: number, cols: ColMap): Stock | null {
+  if (row.length < 4) return null;
+  const date = get(row, cols.date).trim();
+  if (!date || date.toLowerCase() === "date") return null;
+
+  const name   = get(row, cols.name).replace(/\s+/g, " ").trim();
+  const ticker = get(row, cols.ticker).trim();
+  const entry  = toFloat(get(row, cols.entryPrice));
   if (!entry || !ticker) return null;
 
-  const exitPrice     = toFloat(row[4] ?? "");
-  const sl            = toFloat(row[5] ?? "");
-  const cmp           = toFloat(row[6] ?? "") ?? entry;
-  const target        = toFloat(row[7] ?? "") ?? entry;
-  const quantity      = parseInt(row[9] ?? "0") || 0;
-  const moneyInvested = toFloat(row[10] ?? "") ?? entry * quantity;
-  const rawStatus     = (row[11] ?? "").trim();
+  const exitPrice     = toFloat(get(row, cols.exitPrice));
+  const sl            = toFloat(get(row, cols.sl));
+  const cmp           = toFloat(get(row, cols.cmp)) ?? entry;
+  const target        = toFloat(get(row, cols.target)) ?? entry;
+  const quantity      = parseInt(get(row, cols.quantity)) || 0;
+  const moneyInvested = toFloat(get(row, cols.moneyInvested)) ?? entry * quantity;
+
+  const rawStatus = get(row, cols.status).trim().toLowerCase().replace(/\s+/g, " ");
   const status: Status =
-    rawStatus === "Closed" ? "Closed"
-    : rawStatus === "SL Hit" ? "SL Hit"
+    ["closed", "close", "done", "completed", "exited"].includes(rawStatus)
+      ? "Closed"
+    : ["sl hit", "sl-hit", "slhit", "stop loss"].includes(rawStatus)
+      ? "SL Hit"
     : "Open";
-  const category = (row[12] ?? "Stocks").trim() || "Stocks";
+
+  const category = get(row, cols.category).trim() || "Stocks";
 
   return { id, date, name, ticker, entryPrice: entry, exitPrice, sl, cmp, target, quantity, moneyInvested, status, category };
 }
@@ -158,9 +199,10 @@ export default function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
       const text = await res.text();
       const rows = parseCSV(text);
+      const cols = detectColumns(rows[0] ?? []);
       const parsed = rows
         .slice(1)
-        .map((r, i) => rowToStock(r, i + 1))
+        .map((r, i) => rowToStock(r, i + 1, cols))
         .filter((s): s is Stock => s !== null);
       if (parsed.length === 0) throw new Error("No data rows found in sheet. Check the sheet is shared publicly.");
       setStocks(parsed);
@@ -179,48 +221,57 @@ export default function App() {
     return () => clearInterval(timer);
   }, [fetchData]);
 
-  // ── Derived stats ──────────────────────────────────────────────────────────
-  const totalInvested   = useMemo(() => stocks.reduce((s, x) => s + invested(x), 0), [stocks]);
-  const totalCurrentVal = useMemo(() => stocks.reduce((s, x) => s + effectivePrice(x) * x.quantity, 0), [stocks]);
-  const totalPnL        = useMemo(() => stocks.reduce((s, x) => s + pnl(x), 0), [stocks]);
-  const closedStocks    = useMemo(() => stocks.filter(x => x.status !== "Open"), [stocks]);
-  const winRate         = useMemo(() => {
-    const wins = closedStocks.filter(x => pnl(x) > 0).length;
-    return closedStocks.length > 0 ? (wins / closedStocks.length) * 100 : null;
-  }, [closedStocks]);
-  const openCount  = useMemo(() => stocks.filter(x => x.status === "Open").length, [stocks]);
-  const overallROI = totalInvested > 0 ? ((totalCurrentVal / totalInvested - 1) * 100) : 0;
-
+  // allCategories always from full list so tabs never disappear
   const allCategories = useMemo(
     () => ["All", ...Array.from(new Set(stocks.map(s => s.category)))],
     [stocks]
   );
 
-  // ── Chart data ─────────────────────────────────────────────────────────────
+  // viewStocks = category + status filtered (drives KPIs & charts)
+  const viewStocks = useMemo(() =>
+    stocks.filter(s => {
+      if (statusFilter !== "All" && s.status !== statusFilter) return false;
+      if (categoryFilter !== "All" && s.category !== categoryFilter) return false;
+      return true;
+    }),
+    [stocks, statusFilter, categoryFilter]
+  );
+
+  // ── Derived stats (based on current filter selection) ─────────────────────
+  const totalInvested   = useMemo(() => viewStocks.reduce((s, x) => s + invested(x), 0), [viewStocks]);
+  const totalCurrentVal = useMemo(() => viewStocks.reduce((s, x) => s + effectivePrice(x) * x.quantity, 0), [viewStocks]);
+  const totalPnL        = useMemo(() => viewStocks.reduce((s, x) => s + pnl(x), 0), [viewStocks]);
+  const closedStocks    = useMemo(() => viewStocks.filter(x => x.status !== "Open"), [viewStocks]);
+  const winRate         = useMemo(() => {
+    const wins = closedStocks.filter(x => pnl(x) > 0).length;
+    return closedStocks.length > 0 ? (wins / closedStocks.length) * 100 : null;
+  }, [closedStocks]);
+  const openCount  = useMemo(() => viewStocks.filter(x => x.status === "Open").length, [viewStocks]);
+  const overallROI = totalInvested > 0 ? ((totalCurrentVal / totalInvested - 1) * 100) : 0;
+
+  // ── Chart data (based on current filter selection) ─────────────────────────
   const pnlChartData = useMemo(() =>
-    [...stocks].sort((a, b) => pnl(b) - pnl(a)).map(s => ({
+    [...viewStocks].sort((a, b) => pnl(b) - pnl(a)).map(s => ({
       ticker: s.ticker,
       pnl: parseFloat(pnl(s).toFixed(2)),
       color: gainColor(pnl(s)),
-    })), [stocks]);
+    })), [viewStocks]);
 
   const allocationData = useMemo(() =>
-    stocks.map(s => ({ name: s.ticker, fullName: s.name, value: invested(s) })),
-    [stocks]);
+    viewStocks.map(s => ({ name: s.ticker, fullName: s.name, value: invested(s) })),
+    [viewStocks]);
 
   const targetData = useMemo(() =>
-    [...stocks].map(s => ({
+    [...viewStocks].map(s => ({
       ticker: s.ticker,
       pct: parseFloat(toTarget(s).toFixed(2)),
       color: toTarget(s) > 0 ? "#fbbf24" : "#f43f5e",
     })).sort((a, b) => b.pct - a.pct),
-    [stocks]);
+    [viewStocks]);
 
-  // ── Table ──────────────────────────────────────────────────────────────────
+  // ── Table (viewStocks + search) ────────────────────────────────────────────
   const tableData = useMemo(() => {
-    const filtered = stocks.filter(s => {
-      if (statusFilter !== "All" && s.status !== statusFilter) return false;
-      if (categoryFilter !== "All" && s.category !== categoryFilter) return false;
+    const filtered = viewStocks.filter(s => {
       if (search) {
         const q = search.toLowerCase();
         if (!s.name.toLowerCase().includes(q) && !s.ticker.toLowerCase().includes(q)) return false;
@@ -243,7 +294,7 @@ export default function App() {
         default:           return (parseDateStr(a.date) - parseDateStr(b.date)) * dir;
       }
     });
-  }, [stocks, statusFilter, categoryFilter, search, sortKey, sortDir]);
+  }, [viewStocks, search, sortKey, sortDir]);
 
   function handleSort(key: SortKey) {
     if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -310,7 +361,7 @@ export default function App() {
     {
       label: "Total Invested",
       value: fmtINR(totalInvested),
-      sub: `${stocks.length} position${stocks.length !== 1 ? "s" : ""}`,
+      sub: `${viewStocks.length} position${viewStocks.length !== 1 ? "s" : ""}`,
       icon: <Wallet size={14} />,
       color: "#38bdf8",
     },
@@ -484,42 +535,41 @@ export default function App() {
         <div className="bg-card border border-border rounded-lg overflow-hidden">
           {/* Filters */}
           <div className="px-4 py-2.5 border-b border-border flex flex-wrap items-center gap-2">
+            {/* Category — primary tabs */}
+            <div className="flex gap-1 flex-wrap">
+              {allCategories.map(cat => (
+                <button
+                  key={cat}
+                  onClick={() => setCategoryFilter(cat)}
+                  className="px-3 py-1 text-[11px] rounded transition-all"
+                  style={{
+                    background: categoryFilter === cat ? "#06d6a0" : "transparent",
+                    color:      categoryFilter === cat ? "#06091a" : "#5c7399",
+                    fontWeight: categoryFilter === cat ? 600 : 400,
+                  }}
+                >
+                  {cat}
+                </button>
+              ))}
+            </div>
+            <span className="w-px h-4 bg-border" />
+            {/* Status — secondary compact pills */}
             <div className="flex gap-1">
               {STATUS_TABS.map(tab => (
                 <button
                   key={tab}
                   onClick={() => setStatusFilter(tab)}
-                  className="px-2.5 py-1 text-[11px] rounded transition-all"
+                  className="px-2.5 py-1 text-[11px] rounded border transition-all"
                   style={{
-                    background: statusFilter === tab ? "#06d6a0" : "transparent",
-                    color:      statusFilter === tab ? "#06091a" : "#5c7399",
-                    fontWeight: statusFilter === tab ? 600 : 400,
+                    borderColor: statusFilter === tab ? "rgba(255,255,255,0.15)" : "transparent",
+                    background:  statusFilter === tab ? "rgba(255,255,255,0.06)" : "transparent",
+                    color:       statusFilter === tab ? "#dce6f5" : "#5c7399",
                   }}
                 >
                   {tab}
                 </button>
               ))}
             </div>
-            {allCategories.length > 2 && (
-              <>
-                <span className="w-px h-4 bg-border" />
-                <div className="flex gap-1 flex-wrap">
-                  {allCategories.map(cat => (
-                    <button
-                      key={cat}
-                      onClick={() => setCategoryFilter(cat)}
-                      className="px-2.5 py-1 text-[11px] rounded transition-all"
-                      style={{
-                        background: categoryFilter === cat ? "#121b33" : "transparent",
-                        color:      categoryFilter === cat ? "#dce6f5" : "#5c7399",
-                      }}
-                    >
-                      {cat}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
             <div className="ml-auto relative">
               <Search size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: "#5c7399" }} />
               <input
@@ -614,7 +664,7 @@ export default function App() {
           {/* Footer */}
           <div className="px-4 py-2 border-t border-border flex items-center justify-between">
             <span className="text-[11px] text-muted-foreground">
-              {tableData.length} of {stocks.length} position{stocks.length !== 1 ? "s" : ""}
+              {tableData.length} of {viewStocks.length} position{viewStocks.length !== 1 ? "s" : ""}
             </span>
             <span className="text-[11px] text-muted-foreground" style={{ fontFamily: MONO }}>
               Filtered P&L:{" "}
